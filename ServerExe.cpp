@@ -42,17 +42,32 @@ static bool main_thread_exiting = false;
 /**
  * Worker enters its command. This method gives it exclusivity from other workers.
  * ! Must be called with Exit();
- * @return A lock protecting its worker-worker exclusivity.
+ * @return T/F indicating if the worker may proceed. If false, then the worker must terminate.
  */
-std::unique_lock<decltype(worker_exclusive_mtx_)> Enter() {
+bool Enter() {
   std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
+
+  if (main_thread_exiting) {
+    // another worker has told the main thread to quit. This means that we cannot proceed.
+    return false;
+  }
+
+  // Wait until we can acquire exclusive rights to interact with the main thread.
   while(worker_has_exclusive_)
     worker_exclusive_cv_.wait(worker_lock);
-  worker_has_exclusive_ = true;
-  return std::move(worker_lock);
+
+  if (main_thread_exiting) {
+    // It's possible a worker thread triggered a quit while we waited;
+    // This means that we cannot proceed.
+    return false;
+  } else {
+    worker_has_exclusive_ = true;
+    return worker_has_exclusive_;
+  }
 }
 
 void Exit() {
+  std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
   worker_has_exclusive_ = false;
   worker_exclusive_cv_.notify_one();
 }
@@ -64,10 +79,12 @@ class EchoServiceImpl final : public SimpleServer::Service {
   Status Echo(ServerContext* context,
               const EchoRequest* request,
               EchoReply* reply) override {
-    auto worker_ex = Enter();
+    bool worker_proceeds = Enter();
+    if (!worker_proceeds) {
+      return Status::CANCELLED;
+    }
 
     { // worker-main critical section 1
-
       // worker thread sets a notification for the main thread
       std::unique_lock<decltype(mutex_1)> lock1(mutex_1);
       current_command = WorkerCommand::kConsume;
@@ -91,6 +108,11 @@ class EchoServiceImpl final : public SimpleServer::Service {
   Status Command(ServerContext* context,
                  const CommandRequest* request,
                  CommandReply* reply) override {
+    bool worker_proceeds = Enter();
+    if (!worker_proceeds) {
+      return Status::CANCELLED;
+    }
+
     std::string const kQuit = "quit";
     if (request->command() == kQuit) {
       DoQuit();
@@ -99,25 +121,26 @@ class EchoServiceImpl final : public SimpleServer::Service {
       // unknown command. Do not notify main thread, just RPC return an error.
       reply->set_executed(false);
     }
+
+    Exit();
     return Status::OK;
   }
 
   void DoQuit() {
-    auto worker_ex = Enter();
-
     { // critical section 1
       std::unique_lock<decltype(mutex_1)> lock(mutex_1);
       current_command = WorkerCommand::kQuitting;
       condition_1.notify_one();
     }
 
-    // critical section 2
+    // critical section 2, wait for main thread to give us the OKAY
     std::unique_lock<decltype(mutex_2)> lock(mutex_2);
     while(WorkerCommand::kQuitting == current_command)
       condition_2.wait(lock);
 
-    // do cleanup, if any
-    Exit();
+    // now alert all other incoming workers that they must not proceed
+    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
+    main_thread_exiting = true;
   }
 
 };
