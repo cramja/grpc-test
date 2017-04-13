@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unistd.h>
 
 #include <grpc++/grpc++.h>
 
@@ -31,76 +32,21 @@ std::string str_buffer;
 static std::mutex mutex_1, mutex_2;
 static std::condition_variable condition_1, condition_2;
 
-/**
- * Workers must create one of these lock objects when they begin a function. While the object is in scope, it
- * guarentees worker exclusivity of one another. Deleting this object signals another worker to obtain
- * exclusivity rights.
- */
-class WorkerExclusivityLock {
- public:
-  WorkerExclusivityLock()
-    : has_exclusive_lock_(false) {
-    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
-
-    // Wait until we can acquire exclusive rights to interact with the main thread.
-    while (worker_has_exclusive_)
-      worker_exclusive_cv_.wait(worker_lock);
-
-    assert(!worker_has_exclusive_);
-
-    // It's possible a worker thread triggered a quit while we waited:
-    if (!quit_triggered_) {
-      worker_has_exclusive_ = true;
-      has_exclusive_lock_ = true;
-    }
-  }
-
-  ~WorkerExclusivityLock() {
-    if (has_exclusive_lock_) {
-      std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
-      worker_has_exclusive_ = false;
-      worker_exclusive_cv_.notify_one();
-    }
-  }
-
-  /**
-   * Does this worker have exclusivity?
-   * @return True if yes. False means that someone has called static method SignalExit to tell the workers to stop.
-   */
-  bool hasExclusivity() const {
-    return has_exclusive_lock_;
-  }
-
-  static void SignalExit() {
-    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
-    quit_triggered_ = true;
-  }
-
- private:
-  bool has_exclusive_lock_;
-
-  // shared state among all lock-seekers
-  static std::condition_variable worker_exclusive_cv_;
-  static std::mutex worker_exclusive_mtx_;
-  static bool worker_has_exclusive_;
-
-  static bool quit_triggered_;
-};
-
-std::condition_variable  WorkerExclusivityLock::worker_exclusive_cv_;
-std::mutex WorkerExclusivityLock::worker_exclusive_mtx_;
-bool WorkerExclusivityLock::worker_has_exclusive_ = false;
-bool WorkerExclusivityLock::quit_triggered_ = false;
-
 // Logic and data behind the server's behavior.
 // The contained methods will be called from worker callback threads.
 class EchoServiceImpl final : public SimpleServer::Service {
+ public:
+  EchoServiceImpl()
+    : SimpleServer::Service(),
+      running_(true),
+      worker_exclusive_mtx_() {
+  }
 
   Status Echo(ServerContext* context,
               const EchoRequest* request,
               EchoReply* reply) override {
-    WorkerExclusivityLock worker_ex_lock;
-    if (!worker_ex_lock.hasExclusivity()) {
+    auto worker_ex_lock = enter();
+    if (!worker_ex_lock) {
       return Status::CANCELLED;
     }
 
@@ -127,8 +73,8 @@ class EchoServiceImpl final : public SimpleServer::Service {
   Status Command(ServerContext* context,
                  const CommandRequest* request,
                  CommandReply* reply) override {
-    WorkerExclusivityLock worker_ex_lock;
-    if (!worker_ex_lock.hasExclusivity()) {
+    auto worker_ex_lock = enter();
+    if (!worker_ex_lock) {
       return Status::CANCELLED;
     }
 
@@ -157,9 +103,19 @@ class EchoServiceImpl final : public SimpleServer::Service {
       condition_2.wait(lock);
 
     // now alert all other incoming workers that they must not proceed
-    WorkerExclusivityLock::SignalExit();
+    running_ = false;
   }
 
+ private:
+  std::unique_lock<std::mutex> enter() {
+    std::unique_lock<std::mutex> lock(worker_exclusive_mtx_);
+    if (!running_)
+      lock.unlock();
+    return std::move(lock);
+  }
+
+  std::mutex worker_exclusive_mtx_;
+  bool running_;
 };
 
 
