@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+service SimpleServer {
+  rpc Echo (EchoRequest) returns (EchoReply) {}
+
+  rpc Command (CommandRequest) returns (CommandReply) {}
+}
+
+message EchoRequest {
+  string echo_message = 1;
+}
+
+message EchoReply {
+  string echo_response = 1;
+}
+
+message CommandRequest {
+  string command = 1;
+}
+
+message CommandReply {
+  bool executed = 1;
+}
+
