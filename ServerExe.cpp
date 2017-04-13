@@ -31,46 +31,66 @@ std::string str_buffer;
 static std::mutex mutex_1, mutex_2;
 static std::condition_variable condition_1, condition_2;
 
-// State and functions specific to worker-worker exclusivity
-//
-static std::condition_variable worker_exclusive_cv_;
-static std::mutex worker_exclusive_mtx_;
-static bool worker_has_exclusive_ = false;
-
-static bool main_thread_exiting = false;
-
 /**
- * Worker enters its command. This method gives it exclusivity from other workers.
- * ! Must be called with Exit();
- * @return T/F indicating if the worker may proceed. If false, then the worker must terminate.
+ * Workers must create one of these lock objects when they begin a function. While the object is in scope, it
+ * guarentees worker exclusivity of one another. Deleting this object signals another worker to obtain
+ * exclusivity rights.
  */
-bool Enter() {
-  std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
+class WorkerExclusivityLock {
+ public:
+  WorkerExclusivityLock()
+    : has_exclusive_lock_(false) {
+    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
 
-  if (main_thread_exiting) {
-    // another worker has told the main thread to quit. This means that we cannot proceed.
-    return false;
+    // Wait until we can acquire exclusive rights to interact with the main thread.
+    while (worker_has_exclusive_)
+      worker_exclusive_cv_.wait(worker_lock);
+
+    assert(!worker_has_exclusive_);
+
+    // It's possible a worker thread triggered a quit while we waited:
+    if (!quit_triggered_) {
+      worker_has_exclusive_ = true;
+      has_exclusive_lock_ = true;
+    }
   }
 
-  // Wait until we can acquire exclusive rights to interact with the main thread.
-  while(worker_has_exclusive_)
-    worker_exclusive_cv_.wait(worker_lock);
-
-  if (main_thread_exiting) {
-    // It's possible a worker thread triggered a quit while we waited;
-    // This means that we cannot proceed.
-    return false;
-  } else {
-    worker_has_exclusive_ = true;
-    return worker_has_exclusive_;
+  ~WorkerExclusivityLock() {
+    if (has_exclusive_lock_) {
+      std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
+      worker_has_exclusive_ = false;
+      worker_exclusive_cv_.notify_one();
+    }
   }
-}
 
-void Exit() {
-  std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
-  worker_has_exclusive_ = false;
-  worker_exclusive_cv_.notify_one();
-}
+  /**
+   * Does this worker have exclusivity?
+   * @return True if yes. False means that someone has called static method SignalExit to tell the workers to stop.
+   */
+  bool hasExclusivity() const {
+    return has_exclusive_lock_;
+  }
+
+  static void SignalExit() {
+    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
+    quit_triggered_ = true;
+  }
+
+ private:
+  bool has_exclusive_lock_;
+
+  // shared state among all lock-seekers
+  static std::condition_variable worker_exclusive_cv_;
+  static std::mutex worker_exclusive_mtx_;
+  static bool worker_has_exclusive_;
+
+  static bool quit_triggered_;
+};
+
+std::condition_variable  WorkerExclusivityLock::worker_exclusive_cv_;
+std::mutex WorkerExclusivityLock::worker_exclusive_mtx_;
+bool WorkerExclusivityLock::worker_has_exclusive_ = false;
+bool WorkerExclusivityLock::quit_triggered_ = false;
 
 // Logic and data behind the server's behavior.
 // The contained methods will be called from worker callback threads.
@@ -79,8 +99,8 @@ class EchoServiceImpl final : public SimpleServer::Service {
   Status Echo(ServerContext* context,
               const EchoRequest* request,
               EchoReply* reply) override {
-    bool worker_proceeds = Enter();
-    if (!worker_proceeds) {
+    WorkerExclusivityLock worker_ex_lock;
+    if (!worker_ex_lock.hasExclusivity()) {
       return Status::CANCELLED;
     }
 
@@ -101,15 +121,14 @@ class EchoServiceImpl final : public SimpleServer::Service {
       condition_2.wait(lock2);
 
     reply->set_echo_response(request->echo_message() + ": " + str_buffer);
-    Exit();
     return Status::OK;
   }
 
   Status Command(ServerContext* context,
                  const CommandRequest* request,
                  CommandReply* reply) override {
-    bool worker_proceeds = Enter();
-    if (!worker_proceeds) {
+    WorkerExclusivityLock worker_ex_lock;
+    if (!worker_ex_lock.hasExclusivity()) {
       return Status::CANCELLED;
     }
 
@@ -122,7 +141,6 @@ class EchoServiceImpl final : public SimpleServer::Service {
       reply->set_executed(false);
     }
 
-    Exit();
     return Status::OK;
   }
 
@@ -139,8 +157,7 @@ class EchoServiceImpl final : public SimpleServer::Service {
       condition_2.wait(lock);
 
     // now alert all other incoming workers that they must not proceed
-    std::unique_lock<decltype(worker_exclusive_mtx_)> worker_lock(worker_exclusive_mtx_);
-    main_thread_exiting = true;
+    WorkerExclusivityLock::SignalExit();
   }
 
 };
