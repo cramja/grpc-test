@@ -3,6 +3,8 @@ project(TcpServer)
 
 set(CMAKE_CXX_STANDARD 11)
 
+add_subdirectory(gRPC)
+
 add_executable(Client Client.cpp)
 add_executable(Server Server.cpp)
 add_executable(Echoer Echoer.cpp)
