@@ -25,12 +25,20 @@ enum class WorkerCommand {
 };
 
 // State specific to worker-main thread exclusivity
-//
-static WorkerCommand current_command = WorkerCommand::kNone;
-std::string str_buffer;
+struct CCState {
+  CCState() :
+    current_command(WorkerCommand::kNone),
+    str_buffer(""),
+    mutex_1(),
+    mutex_2(),
+    condition_1(),
+    condition_2() {}
 
-static std::mutex mutex_1, mutex_2;
-static std::condition_variable condition_1, condition_2;
+  WorkerCommand current_command;
+  std::string str_buffer;
+  std::mutex mutex_1, mutex_2;
+  std::condition_variable condition_1, condition_2;
+};
 
 // Logic and data behind the server's behavior.
 // The contained methods will be called from worker callback threads.
@@ -52,21 +60,21 @@ class EchoServiceImpl final : public SimpleServer::Service {
 
     { // worker-main critical section 1
       // worker thread sets a notification for the main thread
-      std::unique_lock<decltype(mutex_1)> lock1(mutex_1);
-      current_command = WorkerCommand::kConsume;
-      str_buffer = "";
-      condition_1.notify_one(); // notifies the main thread to wake up
+      std::unique_lock<std::mutex> lock1(cc_state_.mutex_1);
+      cc_state_.current_command = WorkerCommand::kConsume;
+      cc_state_.str_buffer = "";
+      cc_state_.condition_1.notify_one(); // notifies the main thread to wake up
     }
 
     // worker-main critical section 2
     //
     // worker thread waits for the buffered message response from the main thread
     // critical section 2 gives ownership of the buffer
-    std::unique_lock<decltype(mutex_2)> lock2(mutex_2);
-    while (current_command == WorkerCommand::kConsume) // this is the condition that will tell us that the main thread has finished working
-      condition_2.wait(lock2);
+    std::unique_lock<std::mutex> lock2(cc_state_.mutex_2);
+    while (cc_state_.current_command == WorkerCommand::kConsume) // this is the condition that will tell us that the main thread has finished working
+      cc_state_.condition_2.wait(lock2);
 
-    reply->set_echo_response(request->echo_message() + ": " + str_buffer);
+    reply->set_echo_response(request->echo_message() + ": " + cc_state_.str_buffer);
     return Status::OK;
   }
 
@@ -92,18 +100,22 @@ class EchoServiceImpl final : public SimpleServer::Service {
 
   void DoQuit() {
     { // critical section 1
-      std::unique_lock<decltype(mutex_1)> lock(mutex_1);
-      current_command = WorkerCommand::kQuitting;
-      condition_1.notify_one();
+      std::unique_lock<std::mutex> lock(cc_state_.mutex_1);
+      cc_state_.current_command = WorkerCommand::kQuitting;
+      cc_state_.condition_1.notify_one();
     }
 
     // critical section 2, wait for main thread to give us the OKAY
-    std::unique_lock<decltype(mutex_2)> lock(mutex_2);
-    while(WorkerCommand::kQuitting == current_command)
-      condition_2.wait(lock);
+    std::unique_lock<std::mutex> lock(cc_state_.mutex_2);
+    while(WorkerCommand::kQuitting == cc_state_.current_command)
+      cc_state_.condition_2.wait(lock);
 
     // now alert all other incoming workers that they must not proceed
     running_ = false;
+  }
+
+  CCState& GetCCState() {
+    return cc_state_;
   }
 
  private:
@@ -116,6 +128,7 @@ class EchoServiceImpl final : public SimpleServer::Service {
 
   std::mutex worker_exclusive_mtx_;
   bool running_;
+  CCState cc_state_;
 };
 
 
@@ -132,14 +145,14 @@ void RunServer() {
   // Finally assemble the server.
   std::unique_ptr<Server> server(builder.BuildAndStart());
   std::cout << "Server listening on " << server_address << std::endl;
+  CCState& server_cc_state = service.GetCCState();
 
   int cnt = 0;
   forever {
     { // critical section 1: wait for a command
-      std::unique_lock<decltype(mutex_1)> lock(mutex_1);
-      while (current_command == WorkerCommand::kNone) {
-        std::cout << "server main thread woke up" << std::endl;
-        condition_1.wait(lock);
+      std::unique_lock<std::mutex> lock(server_cc_state.mutex_1);
+      while (server_cc_state.current_command == WorkerCommand::kNone) {
+        server_cc_state.condition_1.wait(lock);
         // calling wait releases the mutex, and re-gets it on the call return.
         // therefore, everything after acquiring the lock can be viewed as a critical section
       }
@@ -147,19 +160,19 @@ void RunServer() {
 
     // Now, there is a command. We are now either quitting or performing some work.
     // The worker is now waiting on the condition_2 so we get exclusivity on critical section 2 by locking 2
-    std::unique_lock<decltype(mutex_2)> lock2(mutex_2);
-    if (current_command == WorkerCommand::kQuitting) {
+    std::unique_lock<std::mutex> lock2(server_cc_state.mutex_2);
+    if (server_cc_state.current_command == WorkerCommand::kQuitting) {
       std::cout << "server main thread woke up and got 'quitting'" << std::endl;
-      current_command = WorkerCommand::kNone;
-      condition_2.notify_all();
+      server_cc_state.current_command = WorkerCommand::kNone;
+      server_cc_state.condition_2.notify_all();
       lock2.unlock(); // release now otherwise we deadlock bc Shutdown waits for all RPC threads to finish
       server->Shutdown();
       break;
-    } else if (current_command == WorkerCommand::kConsume) {
+    } else if (server_cc_state.current_command == WorkerCommand::kConsume) {
       std::cout << "server main thread woke up and got 'consume'" << std::endl;
-      str_buffer = std::to_string(cnt++);
-      current_command = WorkerCommand::kNone;
-      condition_2.notify_one();
+      server_cc_state.str_buffer = std::to_string(cnt++);
+      server_cc_state.current_command = WorkerCommand::kNone;
+      server_cc_state.condition_2.notify_one();
     }
   }
   server->Wait();
