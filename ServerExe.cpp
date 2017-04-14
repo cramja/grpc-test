@@ -15,21 +15,11 @@ using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
 
-/**
- * The commands which with worker can issue to the main thread.
- */
-enum class ProducerConsumerStatus {
-  kQuit,
-  kProduceConsume,
-  kNone
-};
-
 class CCState {
  public:
   CCState() :
     consumer_has_input_(false),
     consumer_has_output_(false),
-    current_command(ProducerConsumerStatus::kNone),
     str_buffer(""),
     mutex(),
     condition() {}
@@ -41,7 +31,6 @@ class CCState {
   void consumerOutputReady() {
     consumer_has_input_ = false;
     consumer_has_output_ = true;
-    current_command = ProducerConsumerStatus::kNone;
     condition.notify_all();
   }
 
@@ -49,16 +38,15 @@ class CCState {
    * Notifies the consumer that a piece of work has been created, and that the consumer should execute the command.
    * @param command The command type to be executed. Should not be kNone.
    */
-  void consumerInputReady(ProducerConsumerStatus command) {
+  void consumerInputReady(std::string to_consume) {
     consumer_has_input_ = true;
     consumer_has_output_ = false;
-    current_command = command;
+    str_buffer = to_consume;
     condition.notify_one();
   }
 
   bool consumer_has_input_;
   bool consumer_has_output_;
-  ProducerConsumerStatus current_command;
   std::string str_buffer;
   std::mutex mutex;
   std::condition_variable condition;
@@ -66,17 +54,17 @@ class CCState {
 
 // Logic and data behind the server's behavior.
 // The contained methods will be called from worker callback threads.
-class EchoServiceImpl final : public SimpleServer::Service {
+class CommandServiceImpl final : public SimpleServer::Service {
  public:
-  EchoServiceImpl()
+  CommandServiceImpl()
     : SimpleServer::Service(),
       running_(true),
       worker_exclusive_mtx_() {
   }
 
-  Status Echo(ServerContext* context,
-              const EchoRequest* request,
-              EchoReply* reply) override {
+  Status Command(ServerContext* context,
+                const CommandRequest* request,
+                CommandReply* reply) override {
     auto worker_ex_lock = enter();
     if (!worker_ex_lock) {
       return Status::CANCELLED;
@@ -84,8 +72,7 @@ class EchoServiceImpl final : public SimpleServer::Service {
 
     // Worker thread sets a notification for the main thread.
     // Because of worker exclusivity, we have exclusive rights to this data structure.
-    cc_state_.str_buffer = "";
-    cc_state_.consumerInputReady(ProducerConsumerStatus::kProduceConsume);
+    cc_state_.consumerInputReady(request->args());
 
     // Worker-main critical section:
     // Worker thread waits for the buffered message response from the main thread. The main thread will set
@@ -94,39 +81,16 @@ class EchoServiceImpl final : public SimpleServer::Service {
     while (!cc_state_.consumer_has_output_)
       cc_state_.condition.wait(lock);
 
-    reply->set_echo_response(request->echo_message() + ": " + cc_state_.str_buffer);
-    return Status::OK;
-  }
-
-  Status Command(ServerContext* context,
-                 const CommandRequest* request,
-                 CommandReply* reply) override {
-    auto worker_ex_lock = enter();
-    if (!worker_ex_lock) {
-      return Status::CANCELLED;
-    }
-
-    std::string const kQuit = "quit";
-    if (request->command() == kQuit) {
-      DoQuit();
-      reply->set_executed(true);
+    if (!running_) {
+      // main thread is killing the server
+      reply->set_message("quit");
     } else {
-      // unknown command. Do not notify main thread, just RPC return an error.
-      reply->set_executed(false);
+      reply->set_message(cc_state_.str_buffer);
     }
-
     return Status::OK;
   }
 
-  void DoQuit() {
-    cc_state_.consumerInputReady(ProducerConsumerStatus::kQuit);
-
-    // Critical section, wait for main thread to give us OKAY
-    std::unique_lock<std::mutex> lock(cc_state_.mutex);
-    while(!cc_state_.consumer_has_output_)
-      cc_state_.condition.wait(lock);
-
-    // Now alert all other incoming workers that they must not proceed
+  void kill() {
     running_ = false;
   }
 
@@ -135,6 +99,11 @@ class EchoServiceImpl final : public SimpleServer::Service {
   }
 
  private:
+  /**
+   * When a worker enters, it gains exclusive access to the main thread. That is, no other worker of this service
+   * is allowed to interact with main thread.
+   * @return A lock which grants the worker mutual exclusion.
+   */
   std::unique_lock<std::mutex> enter() {
     std::unique_lock<std::mutex> lock(worker_exclusive_mtx_);
     if (!running_)
@@ -150,7 +119,7 @@ class EchoServiceImpl final : public SimpleServer::Service {
 
 void RunServer() {
   std::string server_address("0.0.0.0:50051");
-  EchoServiceImpl service;
+  CommandServiceImpl service;
 
   ServerBuilder builder;
   // Listen on the given address without any authentication mechanism.
@@ -176,17 +145,20 @@ void RunServer() {
 
     // Now, there is a command. We are now either quitting or performing some work.
     // The worker is now waiting on the condition, and because of worker exclusivity, we do not need to lock.
-    if (server_cc_state.current_command == ProducerConsumerStatus::kQuit) {
+    if ("quit" == server_cc_state.str_buffer) {
       std::cout << "server main thread woke up and got 'quitting'" << std::endl;
+      service.kill();
       server_cc_state.consumerOutputReady();
       server->Shutdown();
       break;
-    } else if (server_cc_state.current_command == ProducerConsumerStatus::kProduceConsume) {
+    } else {
+      // echo
       std::cout << "server main thread woke up and got 'consume'" << std::endl;
-      server_cc_state.str_buffer = std::to_string(cnt++);
+      server_cc_state.str_buffer = server_cc_state.str_buffer + " " + std::to_string(cnt++);
       server_cc_state.consumerOutputReady();
     }
   }
+  // a shutdown had been issued, wait for server to quit.
   server->Wait();
 }
 

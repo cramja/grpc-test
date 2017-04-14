@@ -21,43 +21,49 @@ std::string readInput() {
 class EchoClient {
  public:
   EchoClient(std::shared_ptr<Channel> const & channel)
-    : stub_(SimpleServer::NewStub(channel)) {}
+    : stub_(SimpleServer::NewStub(channel)),
+      last_return_code_(0) {}
 
   // Assembles the client's payload, sends it and presents the response back
   // from the server.
   std::string RequestEcho(const std::string& user) {
     // Data we are sending to the server.
-    EchoRequest request;
-    request.set_echo_message(user);
+    CommandRequest request;
+    request.set_args(user);
+    request.set_type(CommandRequest::kEcho);
 
     // Container for the data we expect from the server.
-    EchoReply reply;
+    CommandReply reply;
 
     // Context for the client. It could be used to convey extra information to
     // the server and/or tweak certain RPC behaviors.
     ClientContext context;
 
     // The actual RPC.
-    Status status = stub_->Echo(&context, request, &reply);
+    Status status = stub_->Command(&context, request, &reply);
 
     // Act upon its status.
     if (status.ok()) {
-      return reply.echo_response();
+      last_return_code_ = reply.return_code();
+      return reply.message();
     } else {
-      std::cout << status.error_code() << ": " << status.error_message()
+      std::cout << status.error_code()
+                << ": " << status.error_message()
                 << std::endl;
       return "RPC failed";
     }
   }
 
-  bool SendQuitCommand() {
+  bool SendQuit() {
     CommandRequest request;
-    request.set_command("quit");
+    request.set_args("quit");
+    request.set_type(CommandRequest::kQuit);
     CommandReply reply;
     ClientContext context;
     Status status = stub_->Command(&context, request, &reply);
     if(status.ok()) {
-      return reply.executed();
+      last_return_code_ = reply.return_code();
+      return last_return_code_ == 0;
     } else {
       std::cout << "on quit: " << status.error_code()
                 << ": " << status.error_message()
@@ -66,21 +72,25 @@ class EchoClient {
     }
   }
 
+  int lastReturnCode() const {
+    return last_return_code_;
+  }
+
  private:
+  int last_return_code_;
   std::unique_ptr<SimpleServer::Stub> stub_;
 };
 
 int main(int argc, char** argv) {
-  std::string user_input = "hello"; // readInput();
-  std::cout << "Echo client sending: " << user_input << std::endl;
-  EchoClient echoer(grpc::CreateChannel(
+  EchoClient client(grpc::CreateChannel(
     "localhost:50051", grpc::InsecureChannelCredentials()));
-  std::string reply = echoer.RequestEcho(user_input);
-  std::cout << "Echo client received: " << reply << std::endl;
-
-  if (argc > 1) {
-    // now issue a quit command
-    std::cout << "issuing quit command, response: " << (echoer.SendQuitCommand() ? "good" : "bad") << std::endl;
+  if (argc < 2){
+    std::string user_input = "client says hello how many times?";
+    std::cout << "Client sending: " << user_input << std::endl;
+    std::string reply = client.RequestEcho(user_input);
+    std::cout << "Client received: " << reply << std::endl;
+  } else {
+    std::cout << "issuing quit command, response: " << (client.SendQuit() ? "good" : "bad") << std::endl;
   }
-  return 0;
+  return client.lastReturnCode();
 }
