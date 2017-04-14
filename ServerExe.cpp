@@ -15,41 +15,41 @@ using grpc::ServerBuilder;
 using grpc::ServerContext;
 using grpc::Status;
 
-class CCState {
+class RequestState {
  public:
-  CCState() :
-    consumer_has_input_(false),
-    consumer_has_output_(false),
-    str_buffer(""),
-    mutex(),
-    condition() {}
+  RequestState() :
+    request_ready_(false),
+    response_ready_(false),
+    buffer_(""),
+    mutex_(),
+    condition_() {}
 
   /**
-   * Notifies that the consumer has finished consuming and that output is ready. To be called after the consumer has
-   * executed.
+   * Notifies waiter that a piece of work has been created and added to the buffer.
+   * @param to_consume The arguments for the consuming thread.
    */
-  void consumerOutputReady() {
-    consumer_has_input_ = false;
-    consumer_has_output_ = true;
-    condition.notify_all();
+  void requestReady(std::string to_consume) {
+    request_ready_ = true;
+    response_ready_ = false;
+    buffer_ = to_consume;
+    condition_.notify_one();
   }
 
   /**
-   * Notifies the consumer that a piece of work has been created, and that the consumer should execute the command.
-   * @param command The command type to be executed. Should not be kNone.
+   * Notifies that the consumer has finished consuming and that a response is ready.
+   * To be called after the consumer has executed.
    */
-  void consumerInputReady(std::string to_consume) {
-    consumer_has_input_ = true;
-    consumer_has_output_ = false;
-    str_buffer = to_consume;
-    condition.notify_one();
+  void responseReady() {
+    request_ready_ = false;
+    response_ready_ = true;
+    condition_.notify_one();
   }
 
-  bool consumer_has_input_;
-  bool consumer_has_output_;
-  std::string str_buffer;
-  std::mutex mutex;
-  std::condition_variable condition;
+  bool request_ready_;
+  bool response_ready_;
+  std::string buffer_;
+  std::mutex mutex_;
+  std::condition_variable condition_;
 };
 
 // Logic and data behind the server's behavior.
@@ -58,7 +58,7 @@ class CommandServiceImpl final : public SimpleServer::Service {
  public:
   CommandServiceImpl()
     : SimpleServer::Service(),
-      running_(true),
+      running_(false),
       worker_exclusive_mtx_() {
   }
 
@@ -72,30 +72,34 @@ class CommandServiceImpl final : public SimpleServer::Service {
 
     // Worker thread sets a notification for the main thread.
     // Because of worker exclusivity, we have exclusive rights to this data structure.
-    cc_state_.consumerInputReady(request->args());
+    request_state_.requestReady(request->args());
 
     // Worker-main critical section:
     // Worker thread waits for the buffered message response from the main thread. The main thread will set
     // consumer_ready_ when it is finished and released its exclusive lock on the communication data structure.
-    std::unique_lock<std::mutex> lock(cc_state_.mutex);
-    while (!cc_state_.consumer_has_output_)
-      cc_state_.condition.wait(lock);
+    std::unique_lock<std::mutex> lock(request_state_.mutex_);
+    while (!request_state_.response_ready_)
+      request_state_.condition_.wait(lock);
 
     if (!running_) {
       // main thread is killing the server
       reply->set_message("quit");
     } else {
-      reply->set_message(cc_state_.str_buffer);
+      reply->set_message(request_state_.buffer_);
     }
     return Status::OK;
+  }
+
+  void ready() {
+    running_ = true;
   }
 
   void kill() {
     running_ = false;
   }
 
-  CCState& GetCCState() {
-    return cc_state_;
+  RequestState& getRequestResponseState() {
+    return request_state_;
   }
 
  private:
@@ -113,7 +117,7 @@ class CommandServiceImpl final : public SimpleServer::Service {
 
   std::mutex worker_exclusive_mtx_;
   bool running_;
-  CCState cc_state_;
+  RequestState request_state_;
 };
 
 
@@ -122,22 +126,20 @@ void RunServer() {
   CommandServiceImpl service;
 
   ServerBuilder builder;
-  // Listen on the given address without any authentication mechanism.
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-  // Register "service" as the instance through which we'll communicate with
-  // clients. In this case it corresponds to an *synchronous* service.
   builder.RegisterService(&service);
-  // Finally assemble the server.
   std::unique_ptr<Server> server(builder.BuildAndStart());
   std::cout << "Server listening on " << server_address << std::endl;
-  CCState& server_cc_state = service.GetCCState();
 
-  int cnt = 0;
+  RequestState& request_state = service.getRequestResponseState();
+  int count = 0;
   forever {
     { // critical section 1: wait for a command
-      std::unique_lock<std::mutex> lock(server_cc_state.mutex);
-      while (!server_cc_state.consumer_has_input_) {
-        server_cc_state.condition.wait(lock);
+      std::unique_lock<std::mutex> lock(request_state.mutex_);
+      // we are now ready to handle requests, allow workers to produce.
+      service.ready();
+      while (!request_state.request_ready_) {
+        request_state.condition_.wait(lock);
         // calling wait releases the mutex, and re-gets it on the call return.
         // therefore, everything after acquiring the lock can be viewed as a critical section
       }
@@ -145,17 +147,17 @@ void RunServer() {
 
     // Now, there is a command. We are now either quitting or performing some work.
     // The worker is now waiting on the condition, and because of worker exclusivity, we do not need to lock.
-    if ("quit" == server_cc_state.str_buffer) {
+    if ("quit" == request_state.buffer_) {
       std::cout << "server main thread woke up and got 'quitting'" << std::endl;
       service.kill();
-      server_cc_state.consumerOutputReady();
+      request_state.responseReady();
       server->Shutdown();
       break;
     } else {
       // echo
       std::cout << "server main thread woke up and got 'consume'" << std::endl;
-      server_cc_state.str_buffer = server_cc_state.str_buffer + " " + std::to_string(cnt++);
-      server_cc_state.consumerOutputReady();
+      request_state.buffer_ = request_state.buffer_ + " " + std::to_string(count++);
+      request_state.responseReady();
     }
   }
   // a shutdown had been issued, wait for server to quit.
