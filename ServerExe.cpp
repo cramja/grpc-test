@@ -18,26 +18,50 @@ using grpc::Status;
 /**
  * The commands which with worker can issue to the main thread.
  */
-enum class WorkerCommand {
-  kQuitting,
-  kConsume,
+enum class ProducerConsumerStatus {
+  kQuit,
+  kProduceConsume,
   kNone
 };
 
-// State specific to worker-main thread exclusivity
-struct CCState {
+class CCState {
+ public:
   CCState() :
-    current_command(WorkerCommand::kNone),
+    consumer_has_input_(false),
+    consumer_has_output_(false),
+    current_command(ProducerConsumerStatus::kNone),
     str_buffer(""),
-    mutex_1(),
-    mutex_2(),
-    condition_1(),
-    condition_2() {}
+    mutex(),
+    condition() {}
 
-  WorkerCommand current_command;
+  /**
+   * Notifies that the consumer has finished consuming and that output is ready. To be called after the consumer has
+   * executed.
+   */
+  void consumerOutputReady() {
+    consumer_has_input_ = false;
+    consumer_has_output_ = true;
+    current_command = ProducerConsumerStatus::kNone;
+    condition.notify_all();
+  }
+
+  /**
+   * Notifies the consumer that a piece of work has been created, and that the consumer should execute the command.
+   * @param command The command type to be executed. Should not be kNone.
+   */
+  void consumerInputReady(ProducerConsumerStatus command) {
+    consumer_has_input_ = true;
+    consumer_has_output_ = false;
+    current_command = command;
+    condition.notify_one();
+  }
+
+  bool consumer_has_input_;
+  bool consumer_has_output_;
+  ProducerConsumerStatus current_command;
   std::string str_buffer;
-  std::mutex mutex_1, mutex_2;
-  std::condition_variable condition_1, condition_2;
+  std::mutex mutex;
+  std::condition_variable condition;
 };
 
 // Logic and data behind the server's behavior.
@@ -58,21 +82,17 @@ class EchoServiceImpl final : public SimpleServer::Service {
       return Status::CANCELLED;
     }
 
-    { // worker-main critical section 1
-      // worker thread sets a notification for the main thread
-      std::unique_lock<std::mutex> lock1(cc_state_.mutex_1);
-      cc_state_.current_command = WorkerCommand::kConsume;
-      cc_state_.str_buffer = "";
-      cc_state_.condition_1.notify_one(); // notifies the main thread to wake up
-    }
+    // Worker thread sets a notification for the main thread.
+    // Because of worker exclusivity, we have exclusive rights to this data structure.
+    cc_state_.str_buffer = "";
+    cc_state_.consumerInputReady(ProducerConsumerStatus::kProduceConsume);
 
-    // worker-main critical section 2
-    //
-    // worker thread waits for the buffered message response from the main thread
-    // critical section 2 gives ownership of the buffer
-    std::unique_lock<std::mutex> lock2(cc_state_.mutex_2);
-    while (cc_state_.current_command == WorkerCommand::kConsume) // this is the condition that will tell us that the main thread has finished working
-      cc_state_.condition_2.wait(lock2);
+    // Worker-main critical section:
+    // Worker thread waits for the buffered message response from the main thread. The main thread will set
+    // consumer_ready_ when it is finished and released its exclusive lock on the communication data structure.
+    std::unique_lock<std::mutex> lock(cc_state_.mutex);
+    while (!cc_state_.consumer_has_output_)
+      cc_state_.condition.wait(lock);
 
     reply->set_echo_response(request->echo_message() + ": " + cc_state_.str_buffer);
     return Status::OK;
@@ -99,18 +119,14 @@ class EchoServiceImpl final : public SimpleServer::Service {
   }
 
   void DoQuit() {
-    { // critical section 1
-      std::unique_lock<std::mutex> lock(cc_state_.mutex_1);
-      cc_state_.current_command = WorkerCommand::kQuitting;
-      cc_state_.condition_1.notify_one();
-    }
+    cc_state_.consumerInputReady(ProducerConsumerStatus::kQuit);
 
-    // critical section 2, wait for main thread to give us the OKAY
-    std::unique_lock<std::mutex> lock(cc_state_.mutex_2);
-    while(WorkerCommand::kQuitting == cc_state_.current_command)
-      cc_state_.condition_2.wait(lock);
+    // Critical section, wait for main thread to give us OKAY
+    std::unique_lock<std::mutex> lock(cc_state_.mutex);
+    while(!cc_state_.consumer_has_output_)
+      cc_state_.condition.wait(lock);
 
-    // now alert all other incoming workers that they must not proceed
+    // Now alert all other incoming workers that they must not proceed
     running_ = false;
   }
 
@@ -150,29 +166,25 @@ void RunServer() {
   int cnt = 0;
   forever {
     { // critical section 1: wait for a command
-      std::unique_lock<std::mutex> lock(server_cc_state.mutex_1);
-      while (server_cc_state.current_command == WorkerCommand::kNone) {
-        server_cc_state.condition_1.wait(lock);
+      std::unique_lock<std::mutex> lock(server_cc_state.mutex);
+      while (!server_cc_state.consumer_has_input_) {
+        server_cc_state.condition.wait(lock);
         // calling wait releases the mutex, and re-gets it on the call return.
         // therefore, everything after acquiring the lock can be viewed as a critical section
       }
     }
 
     // Now, there is a command. We are now either quitting or performing some work.
-    // The worker is now waiting on the condition_2 so we get exclusivity on critical section 2 by locking 2
-    std::unique_lock<std::mutex> lock2(server_cc_state.mutex_2);
-    if (server_cc_state.current_command == WorkerCommand::kQuitting) {
+    // The worker is now waiting on the condition, and because of worker exclusivity, we do not need to lock.
+    if (server_cc_state.current_command == ProducerConsumerStatus::kQuit) {
       std::cout << "server main thread woke up and got 'quitting'" << std::endl;
-      server_cc_state.current_command = WorkerCommand::kNone;
-      server_cc_state.condition_2.notify_all();
-      lock2.unlock(); // release now otherwise we deadlock bc Shutdown waits for all RPC threads to finish
+      server_cc_state.consumerOutputReady();
       server->Shutdown();
       break;
-    } else if (server_cc_state.current_command == WorkerCommand::kConsume) {
+    } else if (server_cc_state.current_command == ProducerConsumerStatus::kProduceConsume) {
       std::cout << "server main thread woke up and got 'consume'" << std::endl;
       server_cc_state.str_buffer = std::to_string(cnt++);
-      server_cc_state.current_command = WorkerCommand::kNone;
-      server_cc_state.condition_2.notify_one();
+      server_cc_state.consumerOutputReady();
     }
   }
   server->Wait();
